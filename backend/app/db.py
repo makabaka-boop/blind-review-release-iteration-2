@@ -55,11 +55,59 @@ CREATE TABLE IF NOT EXISTS assignments (
     manuscript_id INTEGER NOT NULL REFERENCES manuscripts(id) ON DELETE CASCADE,
     reviewer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     revision    INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'submitted')),
+    status      TEXT NOT NULL DEFAULT 'draft',
     content     TEXT NOT NULL DEFAULT '',
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (manuscript_id, reviewer_id)
 );
+
+-- Assignment lifecycle:
+--   draft            editable working copy
+--   submitted        final, immutable
+--   recusal_pending  reviewer asked to recuse; saves/submits are paused
+--   recused          historical record after an approved recusal; never
+--                    editable again and never shown to any reviewer interface
+-- Older databases created the CHECK with only (draft, submitted) under the
+-- same auto-generated constraint name; widen it in place when needed.  The
+-- (manuscript_id, reviewer_id) UNIQUE constraint above means a reviewer can
+-- never hold two rows -- including a historical 'recused' one -- for the same
+-- manuscript.
+DO $$
+DECLARE
+    def TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO def
+    FROM pg_constraint
+    WHERE conrelid = 'assignments'::regclass AND conname = 'assignments_status_check';
+    IF def IS NULL THEN
+        ALTER TABLE assignments
+            ADD CONSTRAINT assignments_status_check
+            CHECK (status IN ('draft', 'submitted', 'recusal_pending', 'recused'));
+    ELSIF def NOT LIKE '%recused%' THEN
+        ALTER TABLE assignments DROP CONSTRAINT assignments_status_check;
+        ALTER TABLE assignments
+            ADD CONSTRAINT assignments_status_check
+            CHECK (status IN ('draft', 'submitted', 'recusal_pending', 'recused'));
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS recusals (
+    id              SERIAL PRIMARY KEY,
+    round_id        INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    assignment_id   INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+    manuscript_id   INTEGER NOT NULL REFERENCES manuscripts(id) ON DELETE CASCADE,
+    reviewer_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'rejected', 'approved')),
+    replacement_assignment_id INTEGER REFERENCES assignments(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at     TIMESTAMPTZ
+);
+
+-- At most one unresolved recusal per assignment.
+CREATE UNIQUE INDEX IF NOT EXISTS recusals_one_pending_per_assignment
+    ON recusals (assignment_id) WHERE status = 'pending';
 """
 
 

@@ -1,6 +1,56 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "./api.js";
 
+function RecusalPanel({ assignment, onRequested }) {
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    if (!reason.trim()) {
+      setError("请填写回避理由");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api(`/api/reviewer/assignments/${assignment.id}/recusal`, {
+        method: "POST",
+        body: { reason },
+      });
+      setReason("");
+      onRequested();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "请求失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="recusal-box">
+      <p className="muted" style={{ margin: "4px 0" }}>
+        发现潜在利益冲突？提交回避申请后该指派将暂停保存与终审，等待管理员处理；
+        仅尚未最终提交的指派可申请。
+      </p>
+      <div className="row">
+        <input
+          style={{ flex: 1 }}
+          placeholder="回避理由（将提交给管理员）"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          disabled={busy}
+        />
+        <button className="danger" disabled={busy}>
+          申请回避
+        </button>
+      </div>
+      {error && <div className="error">{error}</div>}
+    </form>
+  );
+}
+
 function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
   const [content, setContent] = useState(assignment.content || "");
   const [revision, setRevision] = useState(assignment.revision);
@@ -37,7 +87,8 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
     }
   }
 
-  const readOnly = frozen || status === "submitted";
+  const recusalPending = assignment.status === "recusal_pending";
+  const readOnly = frozen || status === "submitted" || recusalPending;
 
   return (
     <div className="card">
@@ -45,10 +96,16 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
         <h2 style={{ margin: 0 }}>
           稿号 #{manuscript?.number ?? "?"}：{manuscript?.title ?? ""}
         </h2>
-        <span className={`badge ${status === "submitted" ? "submitted" : "draft"}`}>
-          {status === "submitted" ? "已最终提交" : "草稿"} · r{revision}
+        <span className={`badge ${status === "submitted" ? "submitted" : recusalPending ? "recusal_pending" : "draft"}`}>
+          {status === "submitted" ? "已最终提交" : recusalPending ? "回避申请待处理" : "草稿"} · r{revision}
         </span>
       </div>
+      {recusalPending && (
+        <div className="notice">
+          回避申请处理中，已暂停保存与最终提交；管理员驳回后草稿会原样恢复。
+          {assignment.recusal_reason ? <div className="muted">理由：{assignment.recusal_reason}</div> : null}
+        </div>
+      )}
       {manuscript?.author && (
         <p className="notice">
           本轮已冻结，作者身份揭示：<strong>{manuscript.author}</strong>
@@ -98,6 +155,9 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
           </button>
           <span className="muted">保存后修订号 +1；并发修改同一修订号时后到的一方会收到 409。</span>
         </div>
+      )}
+      {!frozen && status === "draft" && (
+        <RecusalPanel assignment={assignment} onRequested={onChanged} />
       )}
       {frozen && <p className="muted">本轮已冻结，评审内容只读。</p>}
     </div>

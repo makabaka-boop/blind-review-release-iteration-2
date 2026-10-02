@@ -1,5 +1,9 @@
 from psycopg2.extras import RealDictCursor
 
+# Assignment statuses that currently occupy a reviewer's 3-assignment quota
+# and count as "live" work.  'recused' rows are immutable history only.
+ACTIVE_STATUSES = ("draft", "submitted", "recusal_pending")
+
 
 def serialize_round(
     conn,
@@ -22,19 +26,6 @@ def serialize_round(
         frozen = rnd["status"] == "frozen"
         payload = {"id": rnd["id"], "name": rnd["name"], "status": rnd["status"]}
 
-        cur.execute(
-            "SELECT id, number, title, author FROM manuscripts "
-            "WHERE round_id = %s ORDER BY number",
-            (round_id,),
-        )
-        manuscripts = []
-        for row in cur.fetchall():
-            m = {"id": row["id"], "number": row["number"], "title": row["title"]}
-            if full or frozen:
-                m["author"] = row["author"]
-            manuscripts.append(m)
-        payload["manuscripts"] = manuscripts
-
         if reviewer_id is not None:
             cur.execute(
                 "SELECT 1 FROM round_reviewers WHERE round_id = %s AND user_id = %s",
@@ -42,18 +33,69 @@ def serialize_round(
             )
             if cur.fetchone() is None:
                 return None
+
+            # After a freeze authors are revealed to enrolled reviewers -- but
+            # never for a manuscript this reviewer has a recorded conflict with
+            # (an approved recusal records exactly such a conflict), otherwise a
+            # recused reviewer would learn the author identity they asked to be
+            # shielded from.
+            cur.execute(
+                "SELECT manuscript_id FROM conflicts WHERE round_id = %s AND reviewer_id = %s",
+                (round_id, reviewer_id),
+            )
+            conflicted_ms = {row["manuscript_id"] for row in cur.fetchall()}
+
+            cur.execute(
+                "SELECT id, number, title, author FROM manuscripts "
+                "WHERE round_id = %s ORDER BY number",
+                (round_id,),
+            )
+            manuscripts = []
+            for row in cur.fetchall():
+                m = {"id": row["id"], "number": row["number"], "title": row["title"]}
+                if frozen and row["id"] not in conflicted_ms:
+                    m["author"] = row["author"]
+                manuscripts.append(m)
+            payload["manuscripts"] = manuscripts
+
+            # Reviewers only see their own live assignments.  'recused' rows
+            # stay in the database as history but must surface nowhere in the
+            # reviewer interface (not here, not via the assignment endpoint,
+            # not via anonymous pages).
             cur.execute(
                 """
                 SELECT a.id, a.manuscript_id, m.number AS manuscript_number,
-                       a.revision, a.status, a.content, a.updated_at
-                FROM assignments a JOIN manuscripts m ON m.id = a.manuscript_id
+                       a.revision, a.status, a.content, a.updated_at,
+                       p.id AS recusal_id, p.reason AS recusal_reason,
+                       p.created_at AS recusal_created_at
+                FROM assignments a
+                JOIN manuscripts m ON m.id = a.manuscript_id
+                LEFT JOIN recusals p
+                       ON p.assignment_id = a.id AND p.status = 'pending'
                 WHERE a.round_id = %s AND a.reviewer_id = %s
+                  AND a.status <> 'recused'
                 ORDER BY m.number
                 """,
                 (round_id, reviewer_id),
             )
             payload["assignments"] = [dict(row) for row in cur.fetchall()]
         else:
+            cur.execute(
+                "SELECT id, number, title, author FROM manuscripts "
+                "WHERE round_id = %s ORDER BY number",
+                (round_id,),
+            )
+            manuscripts = []
+            for row in cur.fetchall():
+                m = {
+                    "id": row["id"],
+                    "number": row["number"],
+                    "title": row["title"],
+                    "author": row["author"],
+                }
+                manuscripts.append(m)
+            payload["manuscripts"] = manuscripts
+
             cur.execute(
                 """
                 SELECT rr.user_id, u.username
@@ -82,19 +124,41 @@ def serialize_round(
                 """
                 SELECT a.id, a.manuscript_id, m.number AS manuscript_number,
                        a.reviewer_id, u.username AS reviewer_name,
-                       a.revision, a.status, a.content, a.updated_at
+                       a.revision, a.status, a.content, a.updated_at,
+                       p.id AS recusal_id, p.reason AS recusal_reason,
+                       p.created_at AS recusal_created_at
                 FROM assignments a
                 JOIN manuscripts m ON m.id = a.manuscript_id
                 JOIN users u ON u.id = a.reviewer_id
+                LEFT JOIN recusals p
+                       ON p.assignment_id = a.id AND p.status = 'pending'
                 WHERE a.round_id = %s
                 ORDER BY m.number, u.username
                 """,
                 (round_id,),
             )
             payload["assignments"] = [dict(row) for row in cur.fetchall()]
-            payload["total_assignments"] = len(payload["assignments"])
+            payload["total_assignments"] = sum(
+                1 for a in payload["assignments"] if a["status"] in ACTIVE_STATUSES
+            )
             payload["submitted_assignments"] = sum(
                 1 for a in payload["assignments"] if a["status"] == "submitted"
             )
+
+            cur.execute(
+                """
+                SELECT p.id, p.assignment_id, p.manuscript_id,
+                       m.number AS manuscript_number,
+                       p.reviewer_id, u.username AS reviewer_name,
+                       p.reason, p.created_at
+                FROM recusals p
+                JOIN manuscripts m ON m.id = p.manuscript_id
+                JOIN users u ON u.id = p.reviewer_id
+                WHERE p.round_id = %s AND p.status = 'pending'
+                ORDER BY p.created_at, p.id
+                """,
+                (round_id,),
+            )
+            payload["pending_recusals"] = [dict(row) for row in cur.fetchall()]
 
     return payload

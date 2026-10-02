@@ -130,6 +130,34 @@ th {
   background: #d1fae5;
 }
 
+.badge.recusal_pending {
+  background: #fed7aa;
+}
+
+.badge.recused {
+  background: #e5e7eb;
+  color: #6b7280;
+}
+
+.recusal-box {
+  border-top: 1px dashed #cbd2d9;
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.recusal-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #fbd38d;
+  background: #fffaf0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  flex-wrap: wrap;
+}
+
 .error {
   color: #b91c1c;
   background: #fee2e2;

@@ -41,3 +41,15 @@ class AssignmentIn(BaseModel):
 class DraftIn(BaseModel):
     content: str = Field(max_length=100_000)
     expected_revision: int = Field(ge=0)
+
+
+class RecusalRequestIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class RecusalRejectIn(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+class RecusalApproveIn(BaseModel):
+    replacement_reviewer_id: int
