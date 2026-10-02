@@ -1,5 +1,10 @@
 from psycopg2.extras import RealDictCursor
 
+# Assignment statuses that still count as "live" work for a reviewer / round.
+# 'recused' rows are closed history: they occupy no slot and never appear in
+# reviewer or anonymous (pre-freeze) payloads.
+ACTIVE_STATUSES = ("draft", "submitted", "recusal_pending")
+
 
 def serialize_round(
     conn,
@@ -10,9 +15,10 @@ def serialize_round(
 ) -> dict | None:
     """Return a round payload.
 
-    full=True (admin): all data, including author names.
+    full=True (admin): all data, including author names and recusal history.
     reviewer_id set (reviewer): author names are omitted unless the round is
-    frozen, and only the caller's own assignments are returned.
+    frozen, and only the caller's own active assignments are returned;
+    recused history never appears.
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT id, name, status, created_at FROM rounds WHERE id = %s", (round_id,))
@@ -45,9 +51,13 @@ def serialize_round(
             cur.execute(
                 """
                 SELECT a.id, a.manuscript_id, m.number AS manuscript_number,
-                       a.revision, a.status, a.content, a.updated_at
+                       a.revision, a.status, a.content, a.updated_at,
+                       CASE WHEN a.status = 'recusal_pending' THEN rc.reason END
+                           AS recusal_reason
                 FROM assignments a JOIN manuscripts m ON m.id = a.manuscript_id
+                LEFT JOIN recusals rc ON rc.assignment_id = a.id
                 WHERE a.round_id = %s AND a.reviewer_id = %s
+                  AND a.status IN ('draft', 'submitted', 'recusal_pending')
                 ORDER BY m.number
                 """,
                 (round_id, reviewer_id),
@@ -82,19 +92,34 @@ def serialize_round(
                 """
                 SELECT a.id, a.manuscript_id, m.number AS manuscript_number,
                        a.reviewer_id, u.username AS reviewer_name,
-                       a.revision, a.status, a.content, a.updated_at
+                       a.revision, a.status, a.content, a.updated_at,
+                       rc.id AS recusal_id, rc.reason AS recusal_reason,
+                       rc.status AS recusal_status, rc.created_at AS recusal_created_at,
+                       rc.decided_at AS recusal_decided_at,
+                       rc.replacement_assignment_id AS replacement_assignment_id,
+                       ru.username AS replacement_reviewer_name
                 FROM assignments a
                 JOIN manuscripts m ON m.id = a.manuscript_id
                 JOIN users u ON u.id = a.reviewer_id
+                LEFT JOIN recusals rc ON rc.assignment_id = a.id
+                LEFT JOIN assignments ra ON ra.id = rc.replacement_assignment_id
+                LEFT JOIN users ru ON ru.id = ra.reviewer_id
                 WHERE a.round_id = %s
                 ORDER BY m.number, u.username
                 """,
                 (round_id,),
             )
             payload["assignments"] = [dict(row) for row in cur.fetchall()]
-            payload["total_assignments"] = len(payload["assignments"])
+            # Progress/slot accounting only covers live assignments; recused
+            # rows are history and do not block freezing or occupy a slot.
+            payload["total_assignments"] = sum(
+                1 for a in payload["assignments"] if a["status"] in ACTIVE_STATUSES
+            )
             payload["submitted_assignments"] = sum(
                 1 for a in payload["assignments"] if a["status"] == "submitted"
+            )
+            payload["recusal_pending_count"] = sum(
+                1 for a in payload["assignments"] if a["status"] == "recusal_pending"
             )
 
     return payload

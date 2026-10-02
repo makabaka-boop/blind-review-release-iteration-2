@@ -64,6 +64,62 @@ function ReviewerAccounts({ changed }) {
   );
 }
 
+function PendingRecusalRow({ rc, round, frozen, onReject, onApprove }) {
+  const [replacement, setReplacement] = useState("");
+  const conflicted = new Set(
+    round.conflicts
+      .filter((c) => c.manuscript_id === rc.manuscript_id)
+      .map((c) => c.reviewer_id)
+  );
+  const candidates = round.reviewers
+    .filter((r) => r.user_id !== rc.reviewer_id)
+    .map((r) => ({
+      ...r,
+      conflicted: conflicted.has(r.user_id),
+      full: liveLoadOf(round, r.user_id) >= 3,
+    }));
+  return (
+    <tr>
+      <td>#{rc.manuscript_number}</td>
+      <td>{rc.reviewer_name}</td>
+      <td style={{ maxWidth: 260 }}>{rc.reason}</td>
+      <td>
+        <select value={replacement} disabled={frozen} onChange={(e) => setReplacement(e.target.value)}>
+          <option value="">选择接替评审员…</option>
+          {candidates.map((r) => (
+            <option
+              key={r.user_id}
+              value={r.user_id}
+              disabled={r.conflicted || r.full}
+            >
+              {r.username}
+              {r.conflicted ? "（冲突）" : r.full ? "（已满 3 份）" : ""}
+            </option>
+          ))}
+        </select>
+      </td>
+      <td className="row">
+        <button
+          className="danger"
+          disabled={frozen || !replacement}
+          onClick={() => onApprove(replacement)}
+        >
+          批准回避并转派
+        </button>
+        <button className="secondary" disabled={frozen} onClick={onReject}>
+          驳回（恢复草稿）
+        </button>
+      </td>
+    </tr>
+  );
+}
+
+function liveLoadOf(round, reviewerId) {
+  return round.assignments.filter(
+    (a) => a.reviewer_id === reviewerId && a.status !== "recused"
+  ).length;
+}
+
 function RoundManager({ roundId, allReviewers, onChanged }) {
   const [round, setRound] = useState(null);
   const [mssText, setMssText] = useState("");
@@ -86,6 +142,23 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
     if (!assignedMap.has(a.manuscript_id)) assignedMap.set(a.manuscript_id, []);
     assignedMap.get(a.manuscript_id).push(a);
   }
+  const pendingRecusals = round.assignments
+    .filter((a) => a.status === "recusal_pending")
+    .map((a) => ({
+      recusal_id: a.recusal_id,
+      assignment_id: a.id,
+      manuscript_id: a.manuscript_id,
+      manuscript_number: a.manuscript_number,
+      reviewer_id: a.reviewer_id,
+      reviewer_name: a.reviewer_name,
+      reason: a.recusal_reason,
+    }));
+  // Live slot load per reviewer (recused history does not occupy a slot).
+  const liveLoad = new Map();
+  for (const a of round.assignments) {
+    if (a.status === "recused") continue;
+    liveLoad.set(a.reviewer_id, (liveLoad.get(a.reviewer_id) || 0) + 1);
+  };
   const reviewerName = (id) => {
     const r = round.reviewers.find((x) => x.user_id === id) || allReviewers.find((x) => x.id === id);
     return r ? r.username : `#${id}`;
@@ -166,6 +239,26 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
     }), "分配已删除");
   }
 
+  async function rejectRecusal(rc) {
+    await refresh(() => api(`/api/admin/recusals/${rc.recusal_id}/reject`, { method: "POST" }),
+      "回避申请已驳回，原草稿恢复可编辑");
+  }
+
+  async function approveRecusal(rc, replacementId) {
+    if (!replacementId) {
+      setError("请先选择接替评审员");
+      return;
+    }
+    await refresh(
+      () =>
+        api(`/api/admin/recusals/${rc.recusal_id}/approve`, {
+          method: "POST",
+          body: { replacement_reviewer_id: Number(replacementId) },
+        }),
+      "回避已批准：冲突已登记，并已向接替评审员发放空白指派"
+    );
+  }
+
   async function freeze() {
     setNotice("");
     try {
@@ -191,19 +284,59 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
         {!frozen && (
           <button
             onClick={freeze}
-            disabled={round.submitted_assignments !== round.total_assignments || round.total_assignments === 0}
+            disabled={
+              round.submitted_assignments !== round.total_assignments ||
+              round.total_assignments === 0 ||
+              round.recusal_pending_count > 0
+            }
             title={
-              round.total_assignments === 0
-                ? "尚无分配"
-                : `${round.submitted_assignments}/${round.total_assignments} 已最终提交`
+              round.recusal_pending_count > 0
+                ? `有 ${round.recusal_pending_count} 份回避申请待处理`
+                : round.total_assignments === 0
+                  ? "尚无分配"
+                  : `${round.submitted_assignments}/${round.total_assignments} 已最终提交`
             }
           >
-            原子冻结整轮（{round.submitted_assignments}/{round.total_assignments} 已提交）
+            原子冻结整轮（{round.submitted_assignments}/{round.total_assignments} 已提交
+            {round.recusal_pending_count > 0 ? `，${round.recusal_pending_count} 份回避待处理` : ""}）
           </button>
         )}
       </div>
       {error && <div className="error">{error}</div>}
       {notice && <div className="notice">{notice}</div>}
+
+      {pendingRecusals.length > 0 && (
+        <div className="recusal-box">
+          <h3>待处理回避申请（{pendingRecusals.length}）</h3>
+          <p className="muted">
+            待处理期间该指派暂停保存与终审，整轮不可冻结。驳回即恢复原草稿；批准将在同一事务内登记冲突并向接替评审员发放
+            <strong>全新空白指派</strong>，原草稿仅作历史保留，接替者不可见。
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>稿号</th>
+                <th>申请评审员</th>
+                <th>理由</th>
+                <th>接替评审员（须本轮在列、无冲突、未满 3 份）</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pendingRecusals.map((rc) => (
+                <PendingRecusalRow
+                  key={rc.recusal_id}
+                  rc={rc}
+                  round={round}
+                  frozen={frozen}
+                  onReject={() => rejectRecusal(rc)}
+                  onApprove={(rid) => approveRecusal(rc, rid)}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {!frozen && (
         <form onSubmit={addManuscripts}>
@@ -256,7 +389,8 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
         <tbody>
           {round.manuscripts.map((m) => {
             const assigned = assignedMap.get(m.id) || [];
-            const assignedIds = new Set(assigned.map((a) => a.reviewer_id));
+            const liveAssigned = assigned.filter((a) => a.status !== "recused");
+            const assignedIds = new Set(liveAssigned.map((a) => a.reviewer_id));
             return (
               <tr key={m.id}>
                 <td>#{m.number}</td>
@@ -277,11 +411,20 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
                 </td>
                 <td>
                   {assigned.map((a) => (
-                    <span key={a.id} style={{ marginRight: 8 }}>
+                    <span key={a.id} style={{ marginRight: 8, display: "inline-block" }}>
                       {reviewerName(a.reviewer_id)}
-                      <span className={`badge ${a.status}`} style={{ marginLeft: 4 }}>
-                        {a.status === "draft" ? `草稿 r${a.revision}` : "已提交"}
+                      <span className={`badge ${a.status === "recusal_pending" ? "recusal" : a.status}`} style={{ marginLeft: 4 }}>
+                        {a.status === "draft"
+                          ? `草稿 r${a.revision}`
+                          : a.status === "submitted"
+                            ? "已提交"
+                            : a.status === "recusal_pending"
+                              ? "回避待处理"
+                              : "已回避（历史）"}
                       </span>
+                      {a.status === "recused" && a.replacement_reviewer_name && (
+                        <span className="muted"> → {a.replacement_reviewer_name}</span>
+                      )}
                       {!frozen && a.status === "draft" && (
                         <button className="danger" style={{ padding: "1px 8px", marginLeft: 4 }}
                           onClick={() => removeAssignment(a)}>
@@ -297,7 +440,7 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
                       defaultValue=""
                       onChange={(e) => addAssignment(m.id, e.target.value)}
                       disabled={
-                        assigned.length >= round.reviewers.length
+                        liveAssigned.length >= round.reviewers.length
                       }
                     >
                       <option value="">分配给…</option>
@@ -323,6 +466,7 @@ function RoundManager({ roundId, allReviewers, onChanged }) {
       </table>
       <p className="muted">
         规则：存在利益冲突的分配无法提交；每名评审员至多 3 份（超限的分配请求会被服务器拒绝）。
+        评审员可对未最终提交的指派申请回避；有待处理回避时整轮不能冻结。
       </p>
     </div>
   );
@@ -395,6 +539,11 @@ export default function AdminPage() {
                 <td>{r.manuscript_count}</td>
                 <td>
                   {r.submitted_count}/{r.assignment_count}
+                  {r.recusal_pending_count > 0 && (
+                    <span className="badge recusal" style={{ marginLeft: 6 }}>
+                      {r.recusal_pending_count} 份回避待处理
+                    </span>
+                  )}
                 </td>
                 <td>
                   <button className="secondary" onClick={() => setSelected(r.id)}>

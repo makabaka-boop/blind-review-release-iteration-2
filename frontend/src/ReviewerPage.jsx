@@ -5,6 +5,8 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
   const [content, setContent] = useState(assignment.content || "");
   const [revision, setRevision] = useState(assignment.revision);
   const [status, setStatus] = useState(assignment.status);
+  const [reason, setReason] = useState("");
+  const [recusing, setRecusing] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -37,7 +39,31 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
     }
   }
 
+  async function submitRecusal() {
+    setError("");
+    if (!reason.trim()) {
+      setError("请填写回避理由");
+      return;
+    }
+    setBusy(true);
+    try {
+      const data = await api(`/api/reviewer/assignments/${assignment.id}/recusal`, {
+        method: "POST",
+        body: { reason: reason.trim() },
+      });
+      setStatus(data.status);
+      setRecusing(false);
+      setReason("");
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "请求失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const readOnly = frozen || status === "submitted";
+  const pending = status === "recusal_pending";
 
   return (
     <div className="card">
@@ -45,8 +71,12 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
         <h2 style={{ margin: 0 }}>
           稿号 #{manuscript?.number ?? "?"}：{manuscript?.title ?? ""}
         </h2>
-        <span className={`badge ${status === "submitted" ? "submitted" : "draft"}`}>
-          {status === "submitted" ? "已最终提交" : "草稿"} · r{revision}
+        <span className={`badge ${status === "submitted" ? "submitted" : status === "recusal_pending" ? "recusal" : "draft"}`}>
+          {status === "submitted"
+            ? "已最终提交"
+            : pending
+              ? "回避申请待处理"
+              : `草稿 · r${revision}`}
         </span>
       </div>
       {manuscript?.author && (
@@ -54,15 +84,21 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
           本轮已冻结，作者身份揭示：<strong>{manuscript.author}</strong>
         </p>
       )}
+      {pending && (
+        <p className="notice">
+          回避申请已提交，等待管理员处理；处理期间不能保存草稿或最终提交。若管理员驳回，本页恢复为可编辑草稿。
+          {assignment.recusal_reason ? <><br />理由：{assignment.recusal_reason}</> : null}
+        </p>
+      )}
       {error && <div className="error">{error}</div>}
       {notice && <div className="notice">{notice}</div>}
       <textarea
         value={content}
         onChange={(e) => setContent(e.target.value)}
-        disabled={readOnly || busy}
+        disabled={readOnly || busy || pending}
         placeholder="在此撰写评审意见…"
       />
-      {!readOnly && (
+      {!readOnly && !pending && (
         <div className="row" style={{ marginTop: 8 }}>
           <button
             className="secondary"
@@ -96,7 +132,28 @@ function AssignmentEditor({ assignment, manuscript, frozen, onChanged }) {
           >
             最终提交
           </button>
+          <button className="secondary" disabled={busy} onClick={() => setRecusing((v) => !v)}>
+            {recusing ? "取消回避申请" : "申请回避"}
+          </button>
           <span className="muted">保存后修订号 +1；并发修改同一修订号时后到的一方会收到 409。</span>
+        </div>
+      )}
+      {!readOnly && !pending && recusing && (
+        <div style={{ marginTop: 8 }}>
+          <p className="muted">
+            发现潜在利益冲突？填写理由后申请回避：申请待处理期间暂停保存与终审；批准后您的草稿仅作历史保留，不会透露给接替评审员。
+          </p>
+          <textarea
+            style={{ minHeight: 70 }}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="回避理由（如：与作者存在合作关系）"
+          />
+          <div className="row" style={{ marginTop: 6 }}>
+            <button className="danger" disabled={busy} onClick={submitRecusal}>
+              提交回避申请
+            </button>
+          </div>
         </div>
       )}
       {frozen && <p className="muted">本轮已冻结，评审内容只读。</p>}

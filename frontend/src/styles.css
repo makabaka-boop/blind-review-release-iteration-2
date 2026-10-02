@@ -130,6 +130,22 @@ th {
   background: #d1fae5;
 }
 
+.badge.recusal {
+  background: #fde68a;
+}
+
+.recusal-box {
+  border: 1px solid #f59e0b;
+  background: #fffbeb;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 10px 0 16px;
+}
+
+.recusal-box h3 {
+  margin: 4px 0;
+}
+
 .error {
   color: #b91c1c;
   background: #fee2e2;

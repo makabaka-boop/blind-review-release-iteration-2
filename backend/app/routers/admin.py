@@ -8,6 +8,7 @@ from ..schemas import (
     CreateReviewerIn,
     CreateRoundIn,
     ManuscriptsIn,
+    RecusalDecisionIn,
     ReviewerIdsIn,
 )
 from ..security import hash_password, require_admin
@@ -47,9 +48,12 @@ def list_rounds():
                 """
                 SELECT r.id, r.name, r.status,
                        (SELECT count(*) FROM manuscripts m WHERE m.round_id = r.id) AS manuscript_count,
-                       (SELECT count(*) FROM assignments a WHERE a.round_id = r.id) AS assignment_count,
                        (SELECT count(*) FROM assignments a
-                        WHERE a.round_id = r.id AND a.status = 'submitted') AS submitted_count
+                        WHERE a.round_id = r.id AND a.status <> 'recused') AS assignment_count,
+                       (SELECT count(*) FROM assignments a
+                        WHERE a.round_id = r.id AND a.status = 'submitted') AS submitted_count,
+                       (SELECT count(*) FROM assignments a
+                        WHERE a.round_id = r.id AND a.status = 'recusal_pending') AS recusal_pending_count
                 FROM rounds r ORDER BY r.id
                 """
             )
@@ -226,13 +230,14 @@ def add_conflict(round_id: int, body: ConflictIn):
             if cur.fetchone() is not None:
                 raise HTTPException(status_code=400, detail="conflict already recorded")
             cur.execute(
-                "SELECT 1 FROM assignments WHERE manuscript_id = %s AND reviewer_id = %s",
+                "SELECT 1 FROM assignments "
+                "WHERE manuscript_id = %s AND reviewer_id = %s AND status <> 'recused'",
                 (body.manuscript_id, body.reviewer_id),
             )
             if cur.fetchone() is not None:
                 raise HTTPException(
                     status_code=400,
-                    detail="cannot record conflict: reviewer is already assigned to manuscript "
+                    detail="cannot record conflict: reviewer is currently assigned to manuscript "
                     f"#{manuscript['number']}",
                 )
             cur.execute(
@@ -290,7 +295,8 @@ def add_assignment(round_id: int, body: AssignmentIn):
                     f"to reviewer {reviewer['username']}",
                 )
             cur.execute(
-                "SELECT count(*) AS c FROM assignments WHERE round_id = %s AND reviewer_id = %s",
+                "SELECT count(*) AS c FROM assignments "
+                "WHERE round_id = %s AND reviewer_id = %s AND status <> 'recused'",
                 (round_id, body.reviewer_id),
             )
             count = cur.fetchone()["c"]
@@ -301,10 +307,16 @@ def add_assignment(round_id: int, body: AssignmentIn):
                     f"{MAX_ASSIGNMENTS_PER_REVIEWER} assignments in this round",
                 )
             cur.execute(
-                "SELECT 1 FROM assignments WHERE manuscript_id = %s AND reviewer_id = %s",
+                "SELECT status FROM assignments WHERE manuscript_id = %s AND reviewer_id = %s",
                 (body.manuscript_id, body.reviewer_id),
             )
-            if cur.fetchone() is not None:
+            existing = cur.fetchone()
+            if existing is not None:
+                if existing["status"] == "recused":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reviewer previously recused from this manuscript",
+                    )
                 raise HTTPException(status_code=400, detail="assignment already exists")
             cur.execute(
                 "INSERT INTO assignments (round_id, manuscript_id, reviewer_id) "
@@ -329,17 +341,29 @@ def remove_assignment(round_id: int, assignment_id: int):
             if rnd["status"] == "frozen":
                 raise HTTPException(status_code=409, detail="round is frozen")
             cur.execute(
+                "SELECT status FROM assignments WHERE id = %s AND round_id = %s",
+                (assignment_id, round_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="assignment not found")
+            if row["status"] == "submitted":
+                raise HTTPException(status_code=400, detail="cannot remove a submitted assignment")
+            if row["status"] == "recusal_pending":
+                raise HTTPException(
+                    status_code=400,
+                    detail="cannot remove an assignment with a pending recusal request",
+                )
+            if row["status"] == "recused":
+                raise HTTPException(
+                    status_code=400, detail="cannot remove a recused assignment (history is retained)"
+                )
+            cur.execute(
                 "DELETE FROM assignments WHERE id = %s AND round_id = %s AND status = 'draft'",
                 (assignment_id, round_id),
             )
             if cur.rowcount == 0:
-                cur.execute(
-                    "SELECT 1 FROM assignments WHERE id = %s AND round_id = %s",
-                    (assignment_id, round_id),
-                )
-                if cur.fetchone() is None:
-                    raise HTTPException(status_code=404, detail="assignment not found")
-                raise HTTPException(status_code=400, detail="cannot remove a submitted assignment")
+                raise HTTPException(status_code=400, detail="cannot remove this assignment")
         conn.commit()
         return {"ok": True}
     finally:
@@ -357,9 +381,20 @@ def freeze_round(round_id: int):
             if rnd["status"] == "frozen":
                 raise HTTPException(status_code=409, detail="round is already frozen")
             cur.execute(
+                "SELECT count(*) AS c FROM assignments "
+                "WHERE round_id = %s AND status = 'recusal_pending'",
+                (round_id,),
+            )
+            pending_recusals = cur.fetchone()["c"]
+            if pending_recusals:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"cannot freeze: {pending_recusals} recusal request(s) pending",
+                )
+            cur.execute(
                 "SELECT count(*) AS total, "
                 "count(*) FILTER (WHERE status = 'submitted') AS submitted "
-                "FROM assignments WHERE round_id = %s",
+                "FROM assignments WHERE round_id = %s AND status <> 'recused'",
                 (round_id,),
             )
             stats = cur.fetchone()
@@ -378,5 +413,182 @@ def freeze_round(round_id: int):
         conn.commit()
         payload = serialize_round(conn, round_id, full=True)
         return payload
+    finally:
+        put_conn(conn)
+
+
+def _lock_pending_recusal(cur, round_id: int, recusal_id: int) -> dict:
+    """Lock the round then fetch the pending recusal (and its assignment).
+
+    Every mutating endpoint takes the round lock first, so a pending recusal is
+    serialized against draft saves, submits, freezes and reassignments.
+    """
+    rnd = _get_round_locked(cur, round_id)
+    if rnd is None:
+        raise HTTPException(status_code=404, detail="round not found")
+    if rnd["status"] == "frozen":
+        raise HTTPException(status_code=409, detail="round is frozen")
+    cur.execute(
+        """
+        SELECT rc.id, rc.assignment_id, rc.reason, rc.status,
+               a.manuscript_id, a.reviewer_id, a.round_id
+        FROM recusals rc
+        JOIN assignments a ON a.id = rc.assignment_id
+        WHERE rc.id = %s AND rc.status = 'pending'
+        FOR UPDATE OF rc
+        """,
+        (recusal_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="pending recusal not found")
+    if row["round_id"] != round_id:
+        # Do not leak that the recusal exists in another round.
+        raise HTTPException(status_code=404, detail="pending recusal not found")
+    return row
+
+
+@router.post("/recusals/{recusal_id}/reject")
+def reject_recusal(recusal_id: int):
+    """Deny the request: assignment becomes a live, editable draft again with
+    its former content and revision untouched."""
+    # The round id is discovered from the recusal itself; the round lock is
+    # taken inside _lock_pending_recusal before any row is read for update.
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT assignment_id FROM recusals WHERE id = %s", (recusal_id,))
+            ref = cur.fetchone()
+            if ref is None:
+                raise HTTPException(status_code=404, detail="pending recusal not found")
+            cur.execute("SELECT round_id FROM assignments WHERE id = %s", (ref["assignment_id"],))
+            assignment_ref = cur.fetchone()
+            if assignment_ref is None:
+                raise HTTPException(status_code=404, detail="pending recusal not found")
+            round_id = assignment_ref["round_id"]
+
+            recusal = _lock_pending_recusal(cur, round_id, recusal_id)
+            cur.execute(
+                "UPDATE recusals SET status = 'rejected', decided_at = now() "
+                "WHERE id = %s",
+                (recusal_id,),
+            )
+            cur.execute(
+                "UPDATE assignments SET status = 'draft', updated_at = now() "
+                "WHERE id = %s RETURNING status",
+                (recusal["assignment_id"],),
+            )
+            status = cur.fetchone()["status"]
+        conn.commit()
+        return {"id": recusal_id, "status": "rejected", "assignment_status": status}
+    finally:
+        put_conn(conn)
+
+
+@router.post("/recusals/{recusal_id}/approve")
+def approve_recusal(recusal_id: int, body: RecusalDecisionIn):
+    """Approve recusal, record the conflict, and hand the manuscript to a
+    replacement reviewer — all in one transaction.
+
+    Any validation failure rolls the whole transaction back: the old
+    assignment stays recusal_pending with its draft, and no slot is consumed.
+    """
+    if body.replacement_reviewer_id is None:
+        raise HTTPException(status_code=400, detail="replacement_reviewer_id is required")
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT assignment_id FROM recusals WHERE id = %s", (recusal_id,))
+            ref = cur.fetchone()
+            if ref is None:
+                raise HTTPException(status_code=404, detail="pending recusal not found")
+            cur.execute("SELECT round_id FROM assignments WHERE id = %s", (ref["assignment_id"],))
+            assignment_ref = cur.fetchone()
+            if assignment_ref is None:
+                raise HTTPException(status_code=404, detail="pending recusal not found")
+            round_id = assignment_ref["round_id"]
+
+            recusal = _lock_pending_recusal(cur, round_id, recusal_id)
+            old_assignment_id = recusal["assignment_id"]
+            manuscript_id = recusal["manuscript_id"]
+            old_reviewer_id = recusal["reviewer_id"]
+            new_reviewer_id = body.replacement_reviewer_id
+
+            if new_reviewer_id == old_reviewer_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="replacement reviewer must be different from the recusing reviewer",
+                )
+            manuscript = _validate_round_manuscript(cur, round_id, manuscript_id)
+            reviewer = _validate_round_reviewer(cur, round_id, new_reviewer_id)
+            cur.execute(
+                "SELECT 1 FROM conflicts "
+                "WHERE round_id = %s AND manuscript_id = %s AND reviewer_id = %s",
+                (round_id, manuscript_id, new_reviewer_id),
+            )
+            if cur.fetchone() is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"conflict of interest: reviewer {reviewer['username']} is conflicted "
+                    f"with manuscript #{manuscript['number']}",
+                )
+            # Live slots only: the recusing reviewer's pending assignment still
+            # occupies one slot until this transaction commits, but the
+            # replacement's count is what must stay under the cap.
+            cur.execute(
+                "SELECT count(*) AS c FROM assignments "
+                "WHERE round_id = %s AND reviewer_id = %s AND status <> 'recused'",
+                (round_id, new_reviewer_id),
+            )
+            if cur.fetchone()["c"] >= MAX_ASSIGNMENTS_PER_REVIEWER:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"reviewer {reviewer['username']} already has "
+                    f"{MAX_ASSIGNMENTS_PER_REVIEWER} assignments in this round",
+                )
+            cur.execute(
+                "SELECT 1 FROM assignments WHERE manuscript_id = %s AND reviewer_id = %s",
+                (manuscript_id, new_reviewer_id),
+            )
+            if cur.fetchone() is not None:
+                raise HTTPException(
+                    status_code=400, detail="replacement reviewer already has this manuscript"
+                )
+
+            # 1) close the old assignment as non-submittable history
+            cur.execute(
+                "UPDATE assignments SET status = 'recused', updated_at = now() "
+                "WHERE id = %s RETURNING id",
+                (old_assignment_id,),
+            )
+            # 2) record the conflict that backs the recusal
+            cur.execute(
+                "INSERT INTO conflicts (round_id, manuscript_id, reviewer_id) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (round_id, manuscript_id, old_reviewer_id),
+            )
+            # 3) hand a brand-new blank assignment to the replacement reviewer
+            cur.execute(
+                "INSERT INTO assignments (round_id, manuscript_id, reviewer_id) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (round_id, manuscript_id, new_reviewer_id),
+            )
+            new_assignment_id = cur.fetchone()["id"]
+            # 4) close the recusal and link the replacement
+            cur.execute(
+                "UPDATE recusals SET status = 'approved', decided_at = now(), "
+                "replacement_assignment_id = %s WHERE id = %s",
+                (new_assignment_id, recusal_id),
+            )
+        conn.commit()
+        return {
+            "id": recusal_id,
+            "status": "approved",
+            "old_assignment_id": old_assignment_id,
+            "old_assignment_status": "recused",
+            "replacement_assignment_id": new_assignment_id,
+            "replacement_reviewer_id": new_reviewer_id,
+            "conflict_recorded": True,
+        }
     finally:
         put_conn(conn)

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginIn(BaseModel):
@@ -41,3 +41,19 @@ class AssignmentIn(BaseModel):
 class DraftIn(BaseModel):
     content: str = Field(max_length=100_000)
     expected_revision: int = Field(ge=0)
+
+
+class RecusalIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class RecusalDecisionIn(BaseModel):
+    # Present on approval: the reviewer taking over the manuscript.
+    replacement_reviewer_id: int | None = None

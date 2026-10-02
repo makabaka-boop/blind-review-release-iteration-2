@@ -7,8 +7,8 @@
 
 | 角色 | 能力 |
 | --- | --- |
-| **管理员 admin** | 创建评审轮次（≤20 份稿件、≤10 名评审员）、创建评审员账号、手动分配稿件、登记/删除利益冲突、查看进度、在**全部**分配最终提交后**原子冻结**整轮 |
-| **评审员 reviewer** | 只能看到本轮的**匿名稿号/标题**和**自己的分配**；按修订号保存草稿、最终提交；冻结前看不到任何作者身份 |
+| **管理员 admin** | 创建评审轮次（≤20 份稿件、≤10 名评审员）、创建评审员账号、手动分配稿件、登记/删除利益冲突、查看进度、处理评审员**回避申请**（驳回恢复草稿 / 批准并指定接替者）、在**全部**有效分配最终提交且**无待处理回避**后**原子冻结**整轮 |
+| **评审员 reviewer** | 只能看到本轮的**匿名稿号/标题**和**自己的分配**；按修订号保存草稿、最终提交；发现潜在利益冲突时对**尚未最终提交**的指派申请回避；冻结前看不到任何作者身份 |
 
 默认管理员：`admin` / `adminpass`（可用 `ADMIN_USER` / `ADMIN_PASSWORD` 环境变量覆盖）。
 
@@ -28,7 +28,7 @@ docker compose run --rm verify
 ```
 
 `verify` 是一次性容器（profile `test`，不随 `up` 启动），等待 API 健康后执行
-`verify/run_verify.py` 中的 59 项断言并退出；全部通过时退出码为 0。
+`verify/run_verify.py` 中的 135 项断言并退出；全部通过时退出码为 0。
 
 ## 关键业务规则与实现
 
@@ -59,6 +59,24 @@ docker compose run --rm verify
     不会出现“冻结后仍写入”或“状态不一致”。
 - **冻结后不可变**：存草稿、提交、增删稿件/评审员/冲突/分配均返回 409；
   已提交评审内容保持不变。冻结（揭示作者）后，评审员接口的稿件字段中出现 `author`。
+- **回避（recusal）流程**：
+  - 评审员仅能对**自己的、尚未最终提交**的指派发起
+    `POST /api/reviewer/assignments/{id}/recusal`（理由不能为空）；
+    申请后指派为 `recusal_pending`，**暂停保存草稿与终审**，重复申请返回 409。
+  - 管理员可 `POST /api/admin/recusals/{id}/reject` **驳回**：指派恢复为可编辑
+    `draft`，原草稿内容与修订号原样保留；
+    或 `POST /api/admin/recusals/{id}/approve` **批准**，且必须在**同一事务**内完成：
+    旧指派置为 `recused`（不可再提交、不可删除的历史记录）→ 登记「稿件 × 旧评审员」
+    冲突 → 向接替评审员发放一份**全新空白指派**（revision 0、空内容）。
+  - 接替者必须**本轮在列、与该稿件无冲突、未满 3 份名额、且不是本人**；
+    任一校验失败整体回滚，旧指派保持 `recusal_pending`，名额不变。
+  - **隔离**：`recused` 历史不出现在接替者接口或任何匿名页面；旧评审员对其
+    GET / 存草稿 / 提交 / 再回避一律 404（与不存在不可区分）；旧草稿文本与作者
+    身份均不会经接替者接口泄露。旧指派不再占用名额，仅管理员详情可见。
+  - **屏障与并发**：存在待处理回避时整轮**不能冻结**（409）；回避申请、保存、
+    终审、管理员批准/驳回、转派、冻结全部沿现有 `rounds` 行 `FOR UPDATE` 锁排队，
+    形成确定顺序——同一事务内任何校验失败都保持旧指派与名额不变；两个并发批准
+    恰好一个成功，另一个 404，且只产生一份接替指派。
 
 ## 架构
 
@@ -74,10 +92,11 @@ services:
 
 - `POST /api/login`
 - 管理员（需 admin token）：`/api/admin/rounds`、`/api/admin/reviewers`、
-  `/api/admin/rounds/{id}/{manuscripts,reviewers,conflicts,assignments,freeze}`
+  `/api/admin/rounds/{id}/{manuscripts,reviewers,conflicts,assignments,freeze}`、
+  `/api/admin/recusals/{id}/{reject,approve}`
 - 评审员（需 reviewer token）：`/api/reviewer/rounds`、
   `/api/reviewer/rounds/{id}/manuscripts/{mid}`、
-  `/api/reviewer/assignments/{id}`、`.../draft`、`.../submit`
+  `/api/reviewer/assignments/{id}`、`.../draft`、`.../submit`、`.../recusal`
 
 角色越权：评审员访问管理员接口 → 403；管理员访问评审员接口 → 403；
 无/伪造令牌 → 401。

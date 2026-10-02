@@ -13,6 +13,10 @@ Covers:
   * concurrent duplicate submit and the submit/freeze race (only legal
     orderings may result)
   * immutable frozen round + revealed author fields after freeze
+  * reviewer recusal flow: pending gate, reject restores the draft, approve
+    records the conflict and hands a blank assignment to a replacement;
+    slot/conflict/authorization checks, draft isolation, and barrier races
+    (recusal vs submit/freeze/approval) against real PostgreSQL
 """
 
 import os
@@ -472,6 +476,426 @@ def main():
           u5c.get(f"/api/reviewer/assignments/{a1['id']}", expect=404).status_code == 404)
     check("unenrolled reviewer cannot see frozen round",
           outsider.get(f"/api/reviewer/rounds/{A}", expect=404).status_code == 404)
+
+    # ------------------------------------------------------------- recusals
+    print("[10] recusal requests: authorization, gating and reject")
+    E = admin.post("/api/admin/rounds", {"name": f"E-{run}"}).json()["id"]
+    emss = admin.post(f"/api/admin/rounds/{E}/manuscripts", {"manuscripts": [
+        {"title": f"Recusal-1 {run}", "author": f"{secret}E1"},
+        {"title": f"Recusal-2 {run}", "author": f"{secret}E2"},
+        {"title": f"Recusal-3 {run}", "author": f"{secret}E3"},
+        {"title": f"Recusal-4 {run}", "author": f"{secret}E4"},
+    ]}).json()["manuscripts"]
+    e1m, e2m, e3m, e4m = (x["id"] for x in emss)
+    admin.post(f"/api/admin/rounds/{E}/reviewers",
+               {"reviewer_ids": [u1, u2, u3, u4]})
+    # reviewer cannot raise recusal on someone else's assignment (404)
+    e_a2 = admin.post(f"/api/admin/rounds/{E}/assignments",
+                      {"manuscript_id": e2m, "reviewer_id": u2}).json()["id"]
+    check("cannot recuse another reviewer's assignment",
+          u1c.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                   {"reason": "x"}, expect=404).status_code == 404)
+    check("admin cannot request recusal",
+          admin.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                     {"reason": "x"}, expect=403).status_code == 403)
+    check("blank reason rejected",
+          u2c.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                   {"reason": "   "}, expect=422).status_code == 422)
+    check("recusal of unknown assignment -> 404",
+          u2c.post("/api/reviewer/assignments/999999/recusal",
+                   {"reason": "x"}, expect=404).status_code == 404)
+
+    e_a1 = admin.post(f"/api/admin/rounds/{E}/assignments",
+                      {"manuscript_id": e1m, "reviewer_id": u1}).json()["id"]
+    u1c.put(f"/api/reviewer/assignments/{e_a1}/draft",
+            {"content": "U1-SECRET-DRAFT", "expected_revision": 0})
+    # submit first, then confirm recusal is no longer possible
+    u1c.post(f"/api/reviewer/assignments/{e_a1}/submit",
+             {"content": "U1-FINAL-E1", "expected_revision": 1})
+    check("cannot recuse a submitted assignment",
+          u1c.post(f"/api/reviewer/assignments/{e_a1}/recusal",
+                   {"reason": "late COI"}, expect=400).status_code == 400)
+
+    # the real pending flow happens on u2's draft assignment; save a
+    # distinctive draft first so we can later prove the history keeps it while
+    # the replacement gets nothing.
+    r = u2c.put(f"/api/reviewer/assignments/{e_a2}/draft",
+                {"content": "U2-SECRET-RECUSED-DRAFT", "expected_revision": 0})
+    check("u2 draft saved at revision 1", r.status_code == 200 and r.json()["revision"] == 1, r.text)
+    rr = u2c.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                  {"reason": "co-authored with E2 author"}).json()
+    recusal_id = rr["id"]
+    check("recusal request returns pending status", rr["status"] == "recusal_pending", str(rr))
+    check("duplicate recusal request -> 409",
+          u2c.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                   {"reason": "again"}, expect=409).status_code == 409)
+    # while pending: saves and final submit are suspended
+    check("draft save blocked while pending",
+          u2c.put(f"/api/reviewer/assignments/{e_a2}/draft",
+                  {"content": "x", "expected_revision": 0}, expect=409).status_code == 409)
+    check("final submit blocked while pending",
+          u2c.post(f"/api/reviewer/assignments/{e_a2}/submit",
+                   {"content": "x", "expected_revision": 0}, expect=409).status_code == 409)
+    # admin cannot delete an assignment with pending recusal
+    check("admin cannot remove pending-recusal assignment",
+          admin.delete(f"/api/admin/rounds/{E}/assignments/{e_a2}", expect=400).status_code == 400)
+    # round cannot freeze with a pending recusal
+    fr = admin.post(f"/api/admin/rounds/{E}/freeze", expect=409)
+    check("freeze blocked while recusal pending", fr.status_code == 409, fr.text)
+    ed = admin.get(f"/api/admin/rounds/{E}").json()
+    check("admin detail exposes one pending recusal", ed["recusal_pending_count"] == 1, str(ed.get("recusal_pending_count")))
+    pend = [a for a in ed["assignments"] if a["status"] == "recusal_pending"]
+    check("pending row carries reason and reviewer",
+          len(pend) == 1 and pend[0]["recusal_reason"] == "co-authored with E2 author"
+          and pend[0]["reviewer_id"] == u2, str(pend))
+    lst = admin.get("/api/admin/rounds").json()
+    erow = [r for r in lst if r["id"] == E][0]
+    check("round list shows pending recusal count", erow["recusal_pending_count"] == 1, str(erow))
+    # reviewer payload shows the pending assignment with its reason, still no author
+    rd = u2c.get(f"/api/reviewer/rounds/{E}").json()
+    own = [a for a in rd["assignments"] if a["id"] == e_a2][0]
+    check("reviewer sees own pending assignment",
+          own["status"] == "recusal_pending" and own["recusal_reason"] == "co-authored with E2 author",
+          str(own))
+    check("no author secret leaks while recusal pending", secret not in u2c.get(f"/api/reviewer/rounds/{E}").text)
+
+    print("[11] admin reject: draft restored unchanged")
+    r = admin.post(f"/api/admin/recusals/{recusal_id}/reject")
+    check("reject succeeds", r.status_code == 200, r.text)
+    check("reject returns assignment to draft",
+          r.json()["assignment_status"] == "draft", r.text)
+    # only admin may decide
+    check("reviewer cannot reject recusal",
+          u1c.post(f"/api/admin/recusals/{recusal_id}/reject", expect=403).status_code == 403)
+    # double reject / unknown recusal
+    check("rejecting an already decided recusal -> 404",
+          admin.post(f"/api/admin/recusals/{recusal_id}/reject", expect=404).status_code == 404)
+    check("unknown recusal reject -> 404",
+          admin.post("/api/admin/recusals/999999/reject", expect=404).status_code == 404)
+    after = u2c.get(f"/api/reviewer/assignments/{e_a2}").json()
+    check("draft editable again after reject", after["status"] == "draft", str(after))
+    check("reject restores original draft content and revision",
+          after["content"] == "U2-SECRET-RECUSED-DRAFT" and after["revision"] == 1, str(after))
+    check("rejected reason is cleared from reviewer payload",
+          after.get("recusal_reason") is None, str(after))
+    after_round = u2c.get(f"/api/reviewer/rounds/{E}").json()
+    after_own = [a for a in after_round["assignments"] if a["id"] == e_a2][0]
+    check("rejected reason cleared in round payload too",
+          after_own.get("recusal_reason") is None, str(after_own))
+    # raise again: same row goes back to pending (then approved below)
+    rr = u2c.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                  {"reason": "still conflicted"}).json()
+    recusal_id = rr["id"]
+
+    print("[12] admin approve: validation failures keep slots and assignment intact")
+    # fill u3's 3 slots in round E (e2 is pending for u2, not u3)
+    a_e3 = admin.post(f"/api/admin/rounds/{E}/assignments",
+                      {"manuscript_id": e3m, "reviewer_id": u3}).json()["id"]
+    a_e4 = admin.post(f"/api/admin/rounds/{E}/assignments",
+                      {"manuscript_id": e4m, "reviewer_id": u3}).json()["id"]
+    third_mss = [x for x in (e1m, e2m, e3m, e4m) if x not in (e3m, e4m)][0]
+    a_e5 = admin.post(f"/api/admin/rounds/{E}/assignments",
+                      {"manuscript_id": third_mss, "reviewer_id": u3}).json()["id"]
+    check("approve without body -> 422",
+          admin.post(f"/api/admin/recusals/{recusal_id}/approve", expect=422).status_code == 422)
+    check("approve with self as replacement -> 400",
+          admin.post(f"/api/admin/recusals/{recusal_id}/approve",
+                     {"replacement_reviewer_id": u2}, expect=400).status_code == 400)
+    check("approve with unenrolled replacement -> 400",
+          admin.post(f"/api/admin/recusals/{recusal_id}/approve",
+                     {"replacement_reviewer_id": vids[0]}, expect=400).status_code == 400)
+    check("approve with full (3-slot) replacement -> 400",
+          admin.post(f"/api/admin/recusals/{recusal_id}/approve",
+                     {"replacement_reviewer_id": u3}, expect=400).status_code == 400)
+    # record a conflict for u4 on manuscript 2, then refuse u4 as replacement
+    admin.post(f"/api/admin/rounds/{E}/conflicts",
+               {"manuscript_id": e2m, "reviewer_id": u4})
+    r = admin.post(f"/api/admin/recusals/{recusal_id}/approve",
+                   {"replacement_reviewer_id": u4}, expect=400)
+    check("approve with conflicted replacement -> 400", r.status_code == 400, r.text)
+    check("conflict rejection message stays anonymous", secret not in r.text, r.text)
+    # failed approvals change nothing
+    midstate = admin.get(f"/api/admin/rounds/{E}").json()
+    still_pending = [a for a in midstate["assignments"] if a["id"] == e_a2][0]
+    check("assignment still pending after failed approvals",
+          still_pending["status"] == "recusal_pending", str(still_pending))
+    check("no new assignment / no slot consumed after failures",
+          midstate["recusal_pending_count"] == 1
+          and len([a for a in midstate["assignments"] if a["reviewer_id"] == u3
+                   and a["status"] != "recused"]) == 3,
+          str([(a["reviewer_id"], a["status"]) for a in midstate["assignments"]]))
+
+    print("[13] approve success: blank replacement, history kept, isolation")
+    # u1 has one submitted assignment in E and a free slot; approve to u1
+    r = admin.post(f"/api/admin/recusals/{recusal_id}/approve",
+                   {"replacement_reviewer_id": u1})
+    check("approve with eligible replacement -> 200", r.status_code == 200, r.text)
+    appr = r.json()
+    new_id = appr["replacement_assignment_id"]
+    check("approval response links new blank assignment",
+          appr["old_assignment_id"] == e_a2 and appr["conflict_recorded"] is True
+          and new_id != e_a2, str(appr))
+    ed = admin.get(f"/api/admin/rounds/{E}").json()
+    check("no pending recusals remain", ed["recusal_pending_count"] == 0, str(ed["recusal_pending_count"]))
+    old_row = [a for a in ed["assignments"] if a["id"] == e_a2][0]
+    new_row = [a for a in ed["assignments"] if a["id"] == new_id][0]
+    check("old assignment kept as recused history",
+          old_row["status"] == "recused" and old_row["content"] == "U2-SECRET-RECUSED-DRAFT" and
+          old_row["recusal_status"] == "approved"
+          and old_row["replacement_assignment_id"] == new_id
+          and old_row["replacement_reviewer_name"] == f"u1_{run}",
+          str({k: old_row[k] for k in ("status", "content", "recusal_status")}))
+    check("replacement assignment is blank",
+          new_row["status"] == "draft" and new_row["revision"] == 0 and new_row["content"] == "",
+          str(new_row))
+    check("conflict registered for recusing reviewer",
+          (e2m, u2) in {(c["manuscript_id"], c["reviewer_id"]) for c in ed["conflicts"]},
+          str(ed["conflicts"]))
+    # slot accounting: old row stopped occupying, new occupies one of u1's slots
+    check("recused history does not occupy a slot",
+          len([a for a in ed["assignments"] if a["reviewer_id"] == u2
+               and a["status"] != "recused"]) == 0, str(ed["assignments"]))
+    check("u1 live slot count is 2 (old submitted + new)",
+          len([a for a in ed["assignments"] if a["reviewer_id"] == u1
+               and a["status"] != "recused"]) == 2, str(ed["assignments"]))
+
+    # isolation: former reviewer (u2) loses every trace
+    check("former reviewer GET old assignment -> 404",
+          u2c.get(f"/api/reviewer/assignments/{e_a2}", expect=404).status_code == 404)
+    check("former reviewer cannot save to old assignment",
+          u2c.put(f"/api/reviewer/assignments/{e_a2}/draft",
+                  {"content": "late", "expected_revision": 0}, expect=404).status_code == 404)
+    check("former reviewer cannot submit old assignment",
+          u2c.post(f"/api/reviewer/assignments/{e_a2}/submit",
+                   {"content": "late", "expected_revision": 0}, expect=404).status_code == 404)
+    check("former reviewer cannot recuse old assignment again",
+          u2c.post(f"/api/reviewer/assignments/{e_a2}/recusal",
+                   {"reason": "x"}, expect=404).status_code == 404)
+    u2round = u2c.get(f"/api/reviewer/rounds/{E}").json()
+    check("old assignment absent from former reviewer round payload",
+          all(a["id"] != e_a2 for a in u2round["assignments"])
+          and u2round["assignments"] == [], str(u2round["assignments"]))
+    check("former reviewer manuscript detail -> 404",
+          u2c.get(f"/api/reviewer/rounds/{E}/manuscripts/{e2m}", expect=404).status_code == 404)
+    # isolation: replacement reviewer (u1) sees a clean blank slate, no draft,
+    # no author secret while the round is open
+    na = u1c.get(f"/api/reviewer/assignments/{new_id}").json()
+    check("replacement sees blank new assignment",
+          na["status"] == "draft" and na["revision"] == 0 and na["content"] == ""
+          and na["recusal_reason"] is None, str(na))
+    u1text = u1c.get(f"/api/reviewer/rounds/{E}").text
+    check("old draft text never reaches replacement API",
+          "U2-SECRET-RECUSED-DRAFT" not in u1text and "u2_" not in u1text, u1text[:300])
+    check("author hidden from replacement while open", secret not in u1text)
+    check("replacement manuscript detail anonymous",
+          "author" not in u1c.get(f"/api/reviewer/rounds/{E}/manuscripts/{e2m}").json())
+    # history is immutable: cannot delete, cannot submit, cannot conflict-clean
+    check("admin cannot delete recused history",
+          admin.delete(f"/api/admin/rounds/{E}/assignments/{e_a2}", expect=400).status_code == 400)
+    check("re-assigning manuscript to recused reviewer blocked by conflict",
+          admin.post(f"/api/admin/rounds/{E}/assignments",
+                     {"manuscript_id": e2m, "reviewer_id": u2}, expect=400).status_code == 400)
+    check("duplicate replacement assignment rejected",
+          admin.post(f"/api/admin/rounds/{E}/assignments",
+                     {"manuscript_id": e2m, "reviewer_id": u1}, expect=400).status_code == 400)
+    check("approving an already decided recusal -> 404",
+          admin.post(f"/api/admin/recusals/{recusal_id}/approve",
+                     {"replacement_reviewer_id": u4}, expect=404).status_code == 404)
+
+    print("[14] recusal barrier races against submit / freeze / approval")
+    # race A: recusal vs concurrent submit on one draft assignment (round F).
+    # Whichever takes the round lock first wins; the loser must fail; exactly
+    # one outcome occurs, never a mixed/inconsistent state.
+    F = admin.post("/api/admin/rounds", {"name": f"F-{run}"}).json()["id"]
+    fm = admin.post(f"/api/admin/rounds/{F}/manuscripts",
+                    {"manuscripts": [{"title": f"RaceF {run}", "author": f"{secret}F1"}]}).json()["manuscripts"][0]["id"]
+    admin.post(f"/api/admin/rounds/{F}/reviewers", {"reviewer_ids": [u2]})
+    f_a = admin.post(f"/api/admin/rounds/{F}/assignments",
+                     {"manuscript_id": fm, "reviewer_id": u2}).json()["id"]
+    race = {}
+    barrier = threading.Barrier(2)
+
+    def race_recusal():
+        c = Client(token_u2)
+        barrier.wait()
+        race["recusal"] = c.raw(
+            "POST", f"/api/reviewer/assignments/{f_a}/recusal", {"reason": "race"})
+
+    def race_submit():
+        c = Client(token_u2)
+        barrier.wait()
+        race["submit"] = c.raw(
+            "POST", f"/api/reviewer/assignments/{f_a}/submit",
+            {"content": "FINAL-F", "expected_revision": 0})
+
+    t1 = threading.Thread(target=race_recusal)
+    t2 = threading.Thread(target=race_submit)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    fstate = u2c.get(f"/api/reviewer/assignments/{f_a}").json()
+    check("recusal vs submit: exactly one of 200/200 winner and one 4xx",
+          (race["recusal"].status_code, race["submit"].status_code) in
+          ((200, 409), (400, 200)),
+          str({k: v.status_code for k, v in race.items()}))
+    check("final state matches the winning request",
+          (race["recusal"].status_code == 200 and fstate["status"] == "recusal_pending") or
+          (race["submit"].status_code == 200 and fstate["status"] == "submitted"
+           and fstate["content"] == "FINAL-F"),
+          fstate.get("status", ""))
+
+    # race B: approve-recusal (with a full replacement) vs freeze on round G.
+    # Both take the round lock first; if approval wins it fails (slot cap) and
+    # freeze still sees the pending recusal -> 409; if freeze wins it 409s on
+    # the pending recusal and approval then fails on slots. Either way nothing
+    # changes and no frozen-but-pending state is possible.
+    G = admin.post("/api/admin/rounds", {"name": f"G-{run}"}).json()["id"]
+    gm = admin.post(f"/api/admin/rounds/{G}/manuscripts",
+                    {"manuscripts": [
+                        {"title": f"RaceG1 {run}", "author": f"{secret}G1"},
+                        {"title": f"RaceG2 {run}", "author": f"{secret}G2"},
+                        {"title": f"RaceG3 {run}", "author": f"{secret}G3"},
+                        {"title": f"RaceG4 {run}", "author": f"{secret}G4"},
+                    ]}).json()["manuscripts"]
+    # u4 enrolled now (needed as an approval candidate later); u3 receives
+    # manuscripts 2-4, i.e. all 3 live slots in round G.
+    admin.post(f"/api/admin/rounds/{G}/reviewers", {"reviewer_ids": [u2, u3, u4]})
+    g_a = admin.post(f"/api/admin/rounds/{G}/assignments",
+                     {"manuscript_id": gm[0]["id"], "reviewer_id": u2}).json()["id"]
+    g_ids = []
+    for mm in gm[1:]:
+        g_ids.append(admin.post(f"/api/admin/rounds/{G}/assignments",
+                                {"manuscript_id": mm["id"], "reviewer_id": u3}).json()["id"])
+    grc = u2c.post(f"/api/reviewer/assignments/{g_a}/recusal", {"reason": "race"}).json()["id"]
+    race = {}
+    barrier = threading.Barrier(2)
+
+    def race_approve():
+        c = Client(token_admin)
+        barrier.wait()
+        race["approve"] = c.raw(
+            "POST", f"/api/admin/recusals/{grc}/approve",
+            {"replacement_reviewer_id": u3})
+
+    def race_freeze():
+        c = Client(token_admin)
+        barrier.wait()
+        race["freeze"] = c.raw("POST", f"/api/admin/rounds/{G}/freeze")
+
+    t1 = threading.Thread(target=race_approve)
+    t2 = threading.Thread(target=race_freeze)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    check("approve-vs-freeze: approval fails on slot cap",
+          race["approve"].status_code == 400, race["approve"].text[:200])
+    check("approve-vs-freeze: freeze fails while pending",
+          race["freeze"].status_code == 409, race["freeze"].text[:200])
+    gstate = admin.get(f"/api/admin/rounds/{G}").json()
+    check("round G stays open with recusal still pending",
+          gstate["status"] == "open" and gstate["recusal_pending_count"] == 1
+          and len(gstate["assignments"]) == 4,
+          str((gstate["status"], gstate["recusal_pending_count"], len(gstate["assignments"]))))
+
+    # race C: two concurrent approvals of the same pending recusal by two
+    # eligible candidates (u4 and the freshly enrolled u5). Only one can win
+    # the recusal row; the loser gets 404 and leaves no second replacement.
+    admin.post(f"/api/admin/rounds/{G}/reviewers", {"reviewer_ids": [u5]})
+    race = {}
+    barrier = threading.Barrier(2)
+
+    def race_approve_one(worker, reviewer):
+        c = Client(token_admin)
+        barrier.wait()
+        race[worker] = c.raw(
+            "POST", f"/api/admin/recusals/{grc}/approve",
+            {"replacement_reviewer_id": reviewer})
+
+    t1 = threading.Thread(target=race_approve_one, args=("w1", u4))
+    t2 = threading.Thread(target=race_approve_one, args=("w2", u5))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    codes = sorted(v.status_code for v in race.values())
+    check("concurrent approvals: one 200 one 404", codes == [200, 404], str(codes))
+    winner_id = [v for v in race.values() if v.status_code == 200][0].json()["replacement_assignment_id"]
+    gstate = admin.get(f"/api/admin/rounds/{G}").json()
+    check("exactly one replacement assignment and one recused row exist",
+          len(gstate["assignments"]) == 5
+          and len([a for a in gstate["assignments"] if a["status"] == "recused"]) == 1
+          and len([a for a in gstate["assignments"]
+                   if a["manuscript_id"] == gm[0]["id"] and a["status"] != "recused"]) == 1,
+          str([(a["id"], a["reviewer_name"], a["status"]) for a in gstate["assignments"]]))
+    check("surviving replacement assignment is the 200 response one",
+          any(a["id"] == winner_id for a in gstate["assignments"]), str(winner_id))
+    check("conflict row for old reviewer exists exactly once",
+          len([c for c in gstate["conflicts"]
+               if c["manuscript_id"] == gm[0]["id"] and c["reviewer_id"] == u2]) == 1,
+          str(gstate["conflicts"]))
+
+    # end-to-end: the new replacement can finish and the round then freezes;
+    # after freeze the former reviewer still cannot see the manuscript.
+    gnew = [a for a in gstate["assignments"] if a["manuscript_id"] == gm[0]["id"]
+            and a["status"] != "recused"][0]
+    new_owner = gnew["reviewer_id"]
+    new_client = {u4: tokens["u4"], u5: tokens["u5"]}[new_owner]
+    new_client.post(f"/api/reviewer/assignments/{gnew['id']}/submit",
+                    {"content": "FINAL-G1", "expected_revision": 0})
+    u3c.post(f"/api/reviewer/assignments/{g_ids[0]}/submit",
+             {"content": "FINAL-G2", "expected_revision": 0})
+    u3c.post(f"/api/reviewer/assignments/{g_ids[1]}/submit",
+             {"content": "FINAL-G3", "expected_revision": 0})
+    g4_submit = u3c.post(f"/api/reviewer/assignments/{g_ids[2]}/submit",
+                         {"content": "FINAL-G4", "expected_revision": 0})
+    check("u3 submits all three round-G reviews", g4_submit.status_code == 200, g4_submit.text)
+    fr = admin.post(f"/api/admin/rounds/{G}/freeze")
+    check("freeze G succeeds once replacement finishes", fr.status_code == 200, fr.text[:200])
+    check("recused history still 404 to former reviewer after freeze",
+          u2c.get(f"/api/reviewer/assignments/{g_a}", expect=404).status_code == 404)
+    check("former reviewer still barred from manuscript detail after freeze",
+          u2c.get(f"/api/reviewer/rounds/{G}/manuscripts/{gm[0]['id']}", expect=404).status_code == 404)
+    gfrozen = admin.get(f"/api/admin/rounds/{G}").json()
+    check("recused row preserved in frozen round",
+          any(a["id"] == g_a and a["status"] == "recused" for a in gfrozen["assignments"]),
+          str([(a["id"], a["status"]) for a in gfrozen["assignments"]]))
+    check("recusal reject blocked after freeze",
+          admin.post(f"/api/admin/recusals/{grc}/reject", expect=409).status_code == 409)
+    check("recusal approve blocked after freeze",
+          admin.post(f"/api/admin/recusals/{grc}/approve",
+                     {"replacement_reviewer_id": u4}, expect=409).status_code == 409)
+    check("new recusal on frozen round rejected",
+          new_client.post(f"/api/reviewer/assignments/{gnew['id']}/recusal",
+                          {"reason": "x"}, expect=409).status_code == 409)
+
+    print("[15] concurrent assignment slot race behind the round lock")
+    H2 = admin.post("/api/admin/rounds", {"name": f"H2-{run}"}).json()["id"]
+    h2m = admin.post(f"/api/admin/rounds/{H2}/manuscripts", {"manuscripts": [
+        {"title": "h2a", "author": f"{secret}H2a"},
+        {"title": "h2b", "author": f"{secret}H2b"},
+        {"title": "h2c", "author": f"{secret}H2c"},
+        {"title": "h2d", "author": f"{secret}H2d"},
+    ]}).json()["manuscripts"]
+    admin.post(f"/api/admin/rounds/{H2}/reviewers", {"reviewer_ids": [u2]})
+    # one pre-existing assignment leaves exactly two of the three slots free
+    admin.post(f"/api/admin/rounds/{H2}/assignments",
+               {"manuscript_id": h2m[0]["id"], "reviewer_id": u2})
+    slot_outcomes = {}
+    barrier = threading.Barrier(3)
+
+    def race_assign(worker, mid):
+        c = Client(token_admin)
+        barrier.wait()
+        slot_outcomes[worker] = c.raw("POST", f"/api/admin/rounds/{H2}/assignments",
+                                      {"manuscript_id": mid, "reviewer_id": u2})
+
+    threads = [threading.Thread(target=race_assign, args=(f"w{i}", h2m[i + 1]["id"])) for i in range(3)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    scodes = sorted(r.status_code for r in slot_outcomes.values())
+    check("3 concurrent assignments for 2 remaining slots: two 200 one 400",
+          scodes == [200, 200, 400], str(scodes))
+    h2state = admin.get(f"/api/admin/rounds/{H2}").json()
+    check("exactly 3 live assignments for reviewer after race",
+          len([a for a in h2state["assignments"] if a["reviewer_id"] == u2
+               and a["status"] != "recused"]) == 3,
+          str([(a["id"], a["status"]) for a in h2state["assignments"]]))
+    # rejected request created no assignment: total live rows == 3
+    check("no extra row from the losing request",
+          h2state["total_assignments"] == 3, str(h2state["total_assignments"]))
 
     print()
     print(f"{'='*60}")
